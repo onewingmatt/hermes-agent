@@ -1374,6 +1374,91 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
 
     from agent.memory_manager import inject_memory_provider_tools
     inject_memory_provider_tools(agent)
+    if getattr(agent, "_memory_manager", None) is not None:
+        # The injection count is NOT a usable gate. In a long-lived process (``hermes serve`` builds
+        # an agent per session) the provider's schemas are already on the surface from the memoized
+        # tool-defs list, so ``inject_memory_provider_tools`` returns 0 while the provider tools
+        # still ship eagerly every turn — the sweep was skipped for every session after the first.
+        # Sweep whenever a manager is present; ``_defer_memory_provider_tools`` is idempotent and
+        # fail-open (it returns 0 when the provider declares nothing to defer).
+        _defer_memory_provider_tools(agent)
+
+
+# Tools of an injected memory provider that stay on the eager surface. Everything else the
+# provider declares goes behind ``tool_search`` (still callable, listed in the catalog). Keep
+# this to the rails that are called every session: at 41 Mnemosyne schemas only ~0.4% of the
+# recorded tool calls touch anything outside this set.
+EAGER_MEMORY_PROVIDER_TOOLS = frozenset({
+    "mnemosyne_recall",
+    "mnemosyne_remember",
+    "mnemosyne_task_progress",
+    "mnemosyne_remember_canonical",
+    "mnemosyne_update",
+})
+
+
+def _defer_memory_provider_tools(agent) -> int:
+    """Re-assemble ``agent.tools`` after a memory provider injected its schemas; return how many
+    provider tools were deferred.
+
+    ``inject_memory_provider_tools`` appends a provider's schemas *after*
+    ``model_tools.get_tool_definitions()`` already ran the tool-search assembly, so a provider's
+    whole toolset ships eagerly every turn while ALSO being listed in the tool_search catalog
+    (paid twice) — and ``tools.tool_search.defer`` cannot reach it, because deferral happens
+    before the injection. Re-running the same assembly over the merged set fixes both halves.
+
+    Fail-open: any error leaves the eager list exactly as it was, so a provider is never silently
+    made unreachable.
+    """
+    tools = getattr(agent, "tools", None)
+    memory_manager = getattr(agent, "_memory_manager", None)
+    if not tools or memory_manager is None:
+        return 0
+    get_schemas: Any = getattr(memory_manager, "get_all_tool_schemas", None)
+    if not callable(get_schemas):
+        return 0
+    from agent.memory_manager import normalize_tool_schema
+    provider_names = set()
+    try:
+        for raw_schema in get_schemas() or ():
+            schema = normalize_tool_schema(raw_schema)
+            if schema is not None:
+                provider_names.add(schema["name"])
+    except Exception:
+        logger.debug("Could not read memory-provider tool schemas for deferral", exc_info=True)
+        return 0
+    if not provider_names:
+        return 0
+
+    def _name(tool):
+        return tool.get("function", {}).get("name", "") if isinstance(tool, dict) else ""
+
+    try:
+        import model_tools
+        from tools.tool_search import assemble_tool_defs, load_config as _load_tool_search_config
+        tool_search_config = _load_tool_search_config()
+        if tool_search_config.enabled == "off":
+            return 0
+        assembled = assemble_tool_defs(
+            tools, context_length=model_tools._resolve_active_context_length(),
+            config=tool_search_config)
+    except Exception:
+        logger.debug("Memory-provider tool deferral skipped", exc_info=True)
+        return 0
+    if not assembled.activated:
+        return 0
+
+    keep = EAGER_MEMORY_PROVIDER_TOOLS & provider_names
+    eager = [tool for tool in tools if _name(tool) in keep]
+    merged = [tool for tool in assembled.tool_defs if _name(tool) not in keep] + eager
+    agent.tools = merged
+    agent.valid_tool_names = {_name(tool) for tool in merged if _name(tool)}
+    deferred = len(provider_names - keep)
+    if deferred:
+        logger.info(
+            "Memory provider: %d tool(s) kept eager, %d deferred behind tool_search (~%d tokens/turn freed)",
+            len(keep), deferred, assembled.deferred_tokens)
+    return deferred
 
 
 def _apply_agent_section(agent, _agent_cfg):
